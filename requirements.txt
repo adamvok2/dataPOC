@@ -5,3 +5,4 @@ pyreadstat==1.2.7
 pandas==2.2.2
 pydantic==2.7.4
 openai==1.35.7
+python-multipart==0.0.9

@@ -215,23 +215,25 @@ def ask(body: AskIn):
 # ---------- tiny UI (root) ----------
 @app.get("/", response_class=HTMLResponse)
 def ui():
-    return f"""
+    # keep the dynamic bit small, avoid f-strings over JS/CSS with braces
+    stats = f'<p><small>DB: {DB_PATH} | META: {META_PATH} | BATCH_ROWS: {BATCH}</small></p>'
+
+    return """
 <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>SPSS POC</title>
 <style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:32px auto;padding:0 16px}}
-.card{{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}}
-button{{padding:8px 14px;border-radius:8px;border:1px solid #222;background:#111;color:#fff;cursor:pointer}}
-button:disabled{{opacity:.6;cursor:default}}
-pre{{background:#f7f7f7;padding:12px;border-radius:8px;overflow:auto}}
-input[type=file],textarea,input[type=text]{{width:100%}}
-small{{color:#666}}
-label b{{display:inline-block;min-width:180px}}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:32px auto;padding:0 16px}
+.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:16px 0}
+button{padding:8px 14px;border-radius:8px;border:1px solid #222;background:#111;color:#fff;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+pre{background:#f7f7f7;padding:12px;border-radius:8px;overflow:auto}
+input[type=file],textarea,input[type=text]{width:100%}
+small{color:#666}
+label b{display:inline-block;min-width:180px}
 </style>
 </head><body>
 <h1>SPSS POC</h1>
-<p><small>DB: {DB_PATH} | META: {META_PATH} | BATCH_ROWS: {BATCH}</small></p>
-
+""" + stats + """
 <div class="card">
   <h2>0) Set OpenRouter key (stored in memory only)</h2>
   <label><b>API Key</b></label><input id="key" type="text" placeholder="sk-or-..." />
