@@ -57,20 +57,35 @@ class SetConfigIn(BaseModel):
 
 @app.post("/config")
 def set_config(cfg: SetConfigIn):
-    OPENROUTER["error"] = None
+    OPENROUTER['error'] = None
     try:
-        # import only when needed so startup never dies
-        from openai import OpenAI  # requires openai>=1.0.0
-        model = cfg.model or OPENROUTER["model"]
-        client = OpenAI(base_url="https://openrouter.ai/api/v1",
-                        api_key=cfg.openrouter_api_key.strip())
-        OPENROUTER["client"] = client
-        OPENROUTER["model"] = model
-        return {"ok": True, "model": model}
+        from openai import OpenAI  # openai>=1.x
+        import httpx
+
+        model = cfg.model or OPENROUTER['model']
+
+        # Build our own HTTP client so the OpenAI SDK never tries to pass `proxies=...`
+        # If you actually need a proxy, set it here inside httpx.Client(proxies=...).
+        http_client = httpx.Client(timeout=60.0)  # inherits HTTP(S)_PROXY from env automatically
+
+        client = OpenAI(
+            base_url='https://openrouter.ai/api/v1',
+            api_key=cfg.openrouter_api_key.strip(),
+            http_client=http_client,
+            # Optional, recommended by OpenRouter for analytics/rate-limiting fairness:
+            default_headers={
+                'HTTP-Referer': 'https://example.com',  # set your site if you have one
+                'X-Title': 'SPSS POC',
+            },
+        )
+
+        OPENROUTER['client'] = client
+        OPENROUTER['model'] = model
+        return {'ok': True, 'model': model}
     except Exception as e:
-        OPENROUTER["client"] = None
-        OPENROUTER["error"] = f"OpenRouter init failed: {e}"
-        return JSONResponse({"ok": False, "error": OPENROUTER["error"]}, status_code=400)
+        OPENROUTER['client'] = None
+        OPENROUTER['error'] = f'OpenRouter init failed: {e}'
+        return JSONResponse({'ok': False, 'error': OPENROUTER['error']}, status_code=400)
 
 # ---------- endpoints ----------
 @app.post("/ingest")
