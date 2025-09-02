@@ -32,6 +32,11 @@ OPENROUTER = {"client": None, "model": "openai/gpt-4o-mini", "error": None}
 def sanitize(name: str) -> str:
     return name.replace(" ", "_").replace("-", "_")
 
+def qi(name: str) -> str:
+    # quote a SQL identifier for DuckDB: "foo""bar" style
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def con():
     import duckdb
     return duckdb.connect(DB_PATH)
@@ -164,22 +169,43 @@ class AskIn(BaseModel):
 def t_schema(): return schema()
 
 def t_value_counts(column: str, top: int = 20):
-    import duckdb
-    col = duckdb.escape_identifier(column)
+    col = qi(column)
+    tbl = qi(TABLE)
     df = con().execute(
         f"SELECT {col} AS value, COUNT(*) AS count "
-        f"FROM {TABLE} GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT {int(top)}"
+        f"FROM {tbl} GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT {int(top)}"
     ).fetchdf()
     return {"column": column, "rows": json.loads(df.to_json(orient="records"))}
 
+
 def t_describe():
-    import pandas as pd, duckdb
-    df0 = con().execute(f"SELECT * FROM {TABLE} LIMIT 0").fetchdf()
-    num = [c for c in df0.columns if pd.api.types.is_numeric_dtype(df0[c])]
-    if not num: return {"columns": [], "summary_row": {}}
-    expr = ", ".join([f"min({duckdb.escape_identifier(c)}) as {c}_min, max({duckdb.escape_identifier(c)}) as {c}_max, avg({duckdb.escape_identifier(c)}) as {c}_mean" for c in num])
-    df = con().execute(f"SELECT {expr} FROM {TABLE}").fetchdf()
-    return {"columns": num, "summary_row": json.loads(df.to_json(orient="records"))[0]}
+    c = con()
+    info = c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchdf()
+
+    # DuckDB numeric-ish types we can aggregate with min/max/avg
+    numeric_prefixes = (
+        "TINYINT","SMALLINT","INTEGER","BIGINT","HUGEINT",
+        "UTINYINT","USMALLINT","UINTEGER","UBIGINT",
+        "FLOAT","REAL","DOUBLE","DECIMAL"
+    )
+    num_cols = [row["name"] for _, row in info.iterrows()
+                if str(row["type"]).upper().startswith(numeric_prefixes)]
+
+    if not num_cols:
+        return {"columns": [], "summary_row": {}}
+
+    expr_parts = []
+    for c_name in num_cols:
+        idq = qi(c_name)
+        # aliases are plain (safe ascii)
+        expr_parts.append(f"min({idq}) as {c_name}_min")
+        expr_parts.append(f"max({idq}) as {c_name}_max")
+        expr_parts.append(f"avg({idq}) as {c_name}_mean")
+
+    expr = ", ".join(expr_parts)
+    df = c.execute(f"SELECT {expr} FROM {qi(TABLE)}").fetchdf()
+    return {"columns": num_cols, "summary_row": json.loads(df.to_json(orient='records'))[0]}
+
 
 TOOLS = [
   {"type":"function","function":{"name":"get_schema","parameters":{"type":"object","properties":{}}}},
