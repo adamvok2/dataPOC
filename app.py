@@ -1,3 +1,5 @@
+from fastapi.responses import HTMLResponse
+
 import os, json, tempfile
 import duckdb, pyreadstat, pandas as pd
 from pathlib import Path
@@ -173,3 +175,112 @@ def ask(body: AskIn):
         r2 = oai.chat.completions.create(model=OPENROUTER_MODEL, messages=msgs, temperature=0.1)
         m = r2.choices[0].message
     return {'answer': m.content, 'tools': tool_calls}
+
+@app.get("/", response_class=HTMLResponse)
+def ui():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SPSS POC</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 32px auto; padding: 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 16px 0; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #222; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: default; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 8px; overflow: auto; }
+    input[type=file], textarea { width: 100%; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>SPSS POC</h1>
+  <p><small>Backend is live. This page talks to the same API you saw in /docs.</small></p>
+
+  <div class="card">
+    <h2>1) Upload .sav</h2>
+    <input id="file" type="file" accept=".sav" />
+    <p><small>Start with a small file. On tiny plans set BATCH_ROWS=50000.</small></p>
+    <button id="ingestBtn">Ingest</button>
+    <div id="ingestOut"></div>
+  </div>
+
+  <div class="card">
+    <h2>2) Schema</h2>
+    <button id="schemaBtn">Refresh schema</button>
+    <pre id="schemaPre"></pre>
+  </div>
+
+  <div class="card">
+    <h2>3) Ask the dataset</h2>
+    <textarea id="q" rows="3">Show top 10 values of Gender with counts.</textarea>
+    <br /><br />
+    <button id="askBtn">Ask</button>
+    <h3>Answer</h3>
+    <div id="answer" style="white-space:pre-wrap"></div>
+    <h3>Tool calls</h3>
+    <pre id="toolsPre"></pre>
+  </div>
+
+<script>
+const base = location.origin;
+
+function el(id){ return document.getElementById(id); }
+function jfmt(x){ try { return JSON.stringify(x, null, 2); } catch(e){ return String(x); } }
+
+el('ingestBtn').onclick = async () => {
+  const f = el('file').files[0];
+  if(!f){ alert('Pick a .sav file first'); return; }
+  el('ingestBtn').disabled = true;
+  el('ingestOut').innerHTML = 'Uploading...';
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    const r = await fetch(base + '/ingest', { method: 'POST', body: fd });
+    const text = await r.text();
+    el('ingestOut').innerHTML = '<pre>'+text+'</pre>';
+  } catch (e) {
+    el('ingestOut').innerHTML = '<pre>'+e+'</pre>';
+  } finally {
+    el('ingestBtn').disabled = false;
+  }
+};
+
+el('schemaBtn').onclick = async () => {
+  el('schemaPre').textContent = 'Loading...';
+  try {
+    const r = await fetch(base + '/schema');
+    const j = await r.json();
+    el('schemaPre').textContent = jfmt(j);
+  } catch(e) {
+    el('schemaPre').textContent = String(e);
+  }
+};
+
+el('askBtn').onclick = async () => {
+  const q = el('q').value.trim();
+  if(!q){ alert('Type a question'); return; }
+  el('askBtn').disabled = true;
+  el('answer').textContent = 'Thinking...';
+  el('toolsPre').textContent = '';
+  try {
+    const r = await fetch(base + '/ask', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ question: q })
+    });
+    const j = await r.json();
+    el('answer').textContent = j.answer || '';
+    el('toolsPre').textContent = jfmt(j.tools || []);
+  } catch(e) {
+    el('answer').textContent = String(e);
+  } finally {
+    el('askBtn').disabled = false;
+  }
+};
+</script>
+</body>
+</html>
+    """
