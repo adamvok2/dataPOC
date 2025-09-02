@@ -57,33 +57,30 @@ def save_meta(m: dict):
 
 # Register value-label UDF once per connection
 def register_label_udf(c):
+    # Pull labels from metadata once per connection
     meta = load_meta()
-    vlabels = meta.get("value_labels", {})  # {"gender": {"1":"Male","2":"Female"}, ...}
+    vlabels = meta.get("value_labels", {})  # {"DB2": {"1":"Male","2":"Female"}, ...}
 
-    # normalize keys in mapping to strings for robust matching
+    # Normalize mapping keys to strings for robust matching
     norm = {}
     for col, mapping in vlabels.items():
         norm[str(col)] = {str(k): v for k, v in mapping.items()}
     vlabels = norm
 
     def _label(col_name, val):
-        try:
-            mapping = vlabels.get(str(col_name), None)
-            if mapping is None:
-                return val
-            key = None if val is None else str(val)
-            if key is None:
-                return val
-            return mapping.get(key, mapping.get(val, val))
-        except Exception:
+        # Return the original value if no mapping; otherwise look up by string key
+        mapping = vlabels.get(str(col_name))
+        if not mapping:
             return val
+        if val is None:
+            return val
+        key = str(val)
+        return mapping.get(key, mapping.get(val, val))
 
-    # name: label(col_name, value) -> string
-    try:
-        c.create_function("label", _label, [str, object], str)
-    except Exception:
-        # if already exists in this process/conn, ignore
-        pass
+    # IMPORTANT: don’t pass parameter/return type hints (they break on some versions)
+    # Always replace; don’t swallow failures.
+    c.create_function("label", _label, replace=True)
+
 
 def con():
     import duckdb
@@ -235,10 +232,22 @@ TOOLS = [
   {"type":"function","function":{"name":"get_schema","parameters":{"type":"object","properties":{}}}}
 ]
 
-NAME_TO_TOOL = {
-  "get_schema": lambda **kw: t_schema(),
-  "run_sql":     lambda **kw: {"rows": json.loads(con().execute(_ensure_select(kw["sql"])).fetchdf().to_json(orient="records"))}
-}
+def _run_sql_impl(sql: str):
+    c = con()
+    try:
+        df = c.execute(_ensure_select(sql)).fetchdf()
+    except Exception as e:
+        msg = str(e)
+        # If the function is missing (e.g., brand-new process), register and retry once
+        if "Scalar Function with name label does not exist" in msg:
+            register_label_udf(c)
+            df = c.execute(_ensure_select(sql)).fetchdf()
+        else:
+            raise
+    return {"rows": json.loads(df.to_json(orient="records"))}
+
+NAME_TO_TOOL["run_sql"] = lambda **kw: _run_sql_impl(kw["sql"])
+
 
 SYSTEM_PROMPT = """You are a senior market-research data analyst.
 - Always use the run_sql tool to answer, composing a single SELECT (WITH allowed).
