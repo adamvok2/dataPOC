@@ -1,39 +1,65 @@
-# app.py
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
+
+import os, json, tempfile, logging, math
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-import os, json, tempfile, logging, traceback
-from pathlib import Path
-
-# --------- ZERO-ENV DEFAULTS (local, writable, ephemeral on redeploy) ---------
+# ------------------- storage paths & constants -------------------
 DB_PATH   = "data/spss.duckdb"
 META_PATH = "data/metadata.json"
 TABLE     = "data"
-BATCH     = 50_000  # small chunk = safer on tiny RAM
+BATCH     = 50_000
 
-# ensure folders exist; never crash on boot
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(META_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="SPSS POC (no env vars)")
+# ------------------- app -------------------
+app = FastAPI(title="SPSS POC")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # fine for POC; lock down later
+    allow_origins=["*"],  # POC; lock down later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- in-memory OpenRouter client (set from the UI) ----
-OPENROUTER = {"client": None, "model": "openai/gpt-4o-mini", "error": None}
+# ------------------- OpenRouter (hardcoded) -------------------
+# You asked to hardcode these:
+HARDCODED_MODEL = "openai/gpt-4o-2024-11-20"
+HARDCODED_KEY   = "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"
 
+OPENROUTER = {"client": None, "model": HARDCODED_MODEL, "error": None}
+
+def init_openrouter_client():
+    try:
+        from openai import OpenAI  # openai>=1.x
+        import httpx
+        http_client = httpx.Client(timeout=60.0)  # respects env proxies automatically
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=HARDCODED_KEY,
+            http_client=http_client,
+            default_headers={
+                "HTTP-Referer": "https://example.com",
+                "X-Title": "SPSS POC",
+            },
+        )
+        return client
+    except Exception as e:
+        logging.exception("Failed to init OpenRouter: %s", e)
+        return None
+
+OPENROUTER["client"] = init_openrouter_client()
+
+# ------------------- utilities -------------------
 def sanitize(name: str) -> str:
     return name.replace(" ", "_").replace("-", "_")
 
 def qi(name: str) -> str:
-    # quote a SQL identifier for DuckDB: "foo""bar" style
+    # DuckDB identifier quoting
     return '"' + str(name).replace('"', '""') + '"'
 
 def load_meta():
@@ -50,84 +76,39 @@ def save_meta(m: dict):
         with open(META_PATH, "w", encoding="utf-8") as f:
             json.dump(m, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"Failed to write metadata: {e}")
+        logging.error("Failed to write metadata: %s", e)
 
-# --- label() UDF for value labels -------------------------------------------
-def register_label_udf(c):
+def _duck_label(colname, x):
+    """Python UDF used inside DuckDB SQL: label('DB2', DB2) -> value label text."""
     meta = load_meta()
-    vlabels = meta.get("value_labels", {})  # {"DB2": {"1":"Male", "2":"Female"}, ...}
-
-    # normalize to strings for robust lookup
-    norm = {}
-    for col, mapping in vlabels.items():
-        norm[str(col)] = {str(k): v for k, v in mapping.items()}
-    vlabels = norm
-
-    def _label(col_name, val):
-        mapping = vlabels.get(str(col_name))
-        if not mapping:
-            return val
-        if val is None:
-            return val
-        key = str(val)
-        return mapping.get(key, mapping.get(val, val))
-
-    # Register once per connection; replace=True makes it idempotent
-    c.create_function("label", _label, replace=True)
+    vmap = meta.get("value_labels", {}).get(colname)
+    if not vmap:
+        return x
+    return vmap.get(str(x), x)
 
 def con():
     import duckdb
     c = duckdb.connect(DB_PATH)
+    # register UDF on each connection
     try:
-        register_label_udf(c)
-    except Exception as e:
-        logging.warning(f"label() UDF register failed (continuing): {e}")
+        c.create_function("label", _duck_label)
+    except Exception:
+        pass
     return c
 
-# ---------- config endpoint: paste key from the page ----------
+def _ensure_select(sql: str) -> str:
+    s = sql.strip().lower()
+    if not s.startswith("select"):
+        raise ValueError("Only SELECT queries are allowed.")
+    if " limit " not in s:
+        sql = sql.strip() + " LIMIT 1000"
+    return sql
 
-class SetConfigIn(BaseModel):
-    openrouter_api_key: str
-    model: str | None = None
-
-@app.post("/config")
-def set_config(cfg: SetConfigIn):
-    OPENROUTER['error'] = None
-    try:
-        from openai import OpenAI  # openai>=1.x
-        import httpx
-
-        model = cfg.model or OPENROUTER['model']
-
-        # Build our own HTTP client so the OpenAI SDK never tries to pass `proxies=...`
-        http_client = httpx.Client(timeout=60.0)  # will honor HTTP(S)_PROXY env if present
-
-        client = OpenAI(
-            base_url='https://openrouter.ai/api/v1',
-            api_key=cfg.openrouter_api_key.strip(),
-            http_client=http_client,
-            # Optional, recommended by OpenRouter for analytics/rate-limiting fairness:
-            default_headers={
-                'HTTP-Referer': 'https://example.com',  # set your site if you have one
-                'X-Title': 'SPSS POC',
-            },
-        )
-
-        OPENROUTER['client'] = client
-        OPENROUTER['model'] = model
-        return {'ok': True, 'model': model}
-    except Exception as e:
-        OPENROUTER['client'] = None
-        OPENROUTER['error'] = f'OpenRouter init failed: {e}'
-        return JSONResponse({'ok': False, 'error': OPENROUTER['error']}, status_code=400)
-
-# ---------- ingest .sav -> DuckDB + metadata ---------------------------------
-
+# ------------------- endpoints: ingest / schema / sql -------------------
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
     import duckdb, pyreadstat, pandas as pd  # lazy imports
 
-    # save upload to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=".sav") as tmp:
         tmp.write(await file.read())
         sav_path = tmp.name
@@ -138,29 +119,40 @@ async def ingest(file: UploadFile = File(...)):
     name_map  = dict(zip(meta.column_names, col_names))
 
     c = con()
-    c.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} AS SELECT 1 AS _init LIMIT 0;")
-    c.execute(f"DELETE FROM {TABLE};")
+    c.execute(f"CREATE TABLE IF NOT EXISTS {qi(TABLE)} AS SELECT 1 AS _init LIMIT 0;")
+    c.execute(f"DELETE FROM {qi(TABLE)};")
 
-    # chunked load to avoid RAM spikes
-    offset = 0; total = 0
+    # chunked load
+    offset = 0
+    total = 0
     while True:
-        df, _ = pyreadstat.read_sav(sav_path, row_offset=offset, row_limit=BATCH, apply_value_formats=False)
-        if df.empty: break
+        df, _ = pyreadstat.read_sav(
+            sav_path,
+            row_offset=offset,
+            row_limit=BATCH,
+            apply_value_formats=False  # keep raw coded values
+        )
+        if df.empty:
+            break
         df = df.rename(columns=name_map)
         for col in df.columns:
             if df[col].dtype == "object":
                 df[col] = df[col].astype("string")
         if total == 0:
             c.register("chunk", df)
-            c.execute(f"CREATE OR REPLACE TABLE {TABLE} AS SELECT * FROM chunk")
+            c.execute(f"CREATE OR REPLACE TABLE {qi(TABLE)} AS SELECT * FROM chunk")
             c.unregister("chunk")
         else:
             c.register("chunk", df)
-            c.execute(f"INSERT INTO {TABLE} SELECT * FROM chunk")
+            c.execute(f"INSERT INTO {qi(TABLE)} SELECT * FROM chunk")
             c.unregister("chunk")
-        n = len(df); total += n; offset += n
-        if n < BATCH: break
+        n = len(df)
+        total += n
+        offset += n
+        if n < BATCH:
+            break
 
+    # capture labels
     value_labels = {name_map.get(k, k): v for k, v in meta.variable_value_labels.items()}
     col_labels   = {name_map.get(k, k): v for k, v in meta.column_names_to_labels.items()}
     save_meta({
@@ -171,58 +163,55 @@ async def ingest(file: UploadFile = File(...)):
         "source_filename": file.filename
     })
 
-    try: os.remove(sav_path)
-    except Exception: pass
+    try:
+        os.remove(sav_path)
+    except Exception:
+        pass
 
     return {"status": "ok", "rows": total, "columns": col_names}
-
-# ---------- schema & simple SQL ----------------------------------------------
 
 @app.get("/schema")
 def schema():
     c = con()
-    info = c.execute(f"PRAGMA table_info('{TABLE}')").fetchall()
+    info = c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchall()
     meta = load_meta()
     cols = [{"name": i[1], "type": i[2], "label": meta.get("column_labels", {}).get(i[1], "")} for i in info]
     return {"table": TABLE, "columns": cols, "rows": meta.get("rows"), "source": meta.get("source_filename")}
 
-def _ensure_select(sql: str) -> str:
-    s = sql.strip().lower()
-    if not s.startswith("select"):
-        raise ValueError("SELECT only")
-    if " limit " not in s:
-        sql = sql.strip() + " LIMIT 1000"
-    return sql
-
 class SqlIn(BaseModel):
     sql: str
+
+def _run_sql_impl(sql: str):
+    df = con().execute(_ensure_select(sql)).fetchdf()
+    return {"rows": json.loads(df.to_json(orient="records"))}
 
 @app.post("/sql")
 def sql(q: SqlIn):
     try:
-        df = con().execute(_ensure_select(q.sql)).fetchdf()
-        return {"rows": json.loads(df.to_json(orient="records"))}
+        return _run_sql_impl(q.sql)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ---------- Tools callable by the LLM ----------------------------------------
-
-def t_schema(): return schema()
+# ------------------- simple tools (schema, value_counts, describe) -------------------
+def t_schema():
+    return schema()
 
 def t_value_counts(column: str, top: int = 20):
-    col = qi(column)
-    tbl = qi(TABLE)
-    df = con().execute(
-        f"SELECT {col} AS value, COUNT(*) AS count "
-        f"FROM {tbl} GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT {int(top)}"
+    c = con()
+    df = c.execute(
+        f"""
+        SELECT label({qi(column)!r}, {qi(column)}) AS value, COUNT(*) AS count
+        FROM {qi(TABLE)}
+        GROUP BY 1
+        ORDER BY 2 DESC NULLS LAST
+        LIMIT {int(top)}
+        """
     ).fetchdf()
     return {"column": column, "rows": json.loads(df.to_json(orient="records"))}
 
 def t_describe():
     c = con()
     info = c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchdf()
-
-    # DuckDB numeric-ish types we can aggregate with min/max/avg
     numeric_prefixes = (
         "TINYINT","SMALLINT","INTEGER","BIGINT","HUGEINT",
         "UTINYINT","USMALLINT","UINTEGER","UBIGINT",
@@ -232,65 +221,233 @@ def t_describe():
                 if str(row["type"]).upper().startswith(numeric_prefixes)]
     if not num_cols:
         return {"columns": [], "summary_row": {}}
-
-    expr_parts = []
-    for c_name in num_cols:
-        idq = qi(c_name)
-        expr_parts.append(f"min({idq}) as {c_name}_min")
-        expr_parts.append(f"max({idq}) as {c_name}_max")
-        expr_parts.append(f"avg({idq}) as {c_name}_mean")
-
-    expr = ", ".join(expr_parts)
+    expr = ", ".join([f"min({qi(cn)}) as {cn}_min, max({qi(cn)}) as {cn}_max, avg({qi(cn)}) as {cn}_mean" for cn in num_cols])
     df = c.execute(f"SELECT {expr} FROM {qi(TABLE)}").fetchdf()
     return {"columns": num_cols, "summary_row": json.loads(df.to_json(orient='records'))[0]}
 
-def _run_sql_impl(sql: str):
-    c = con()
-    try:
-        df = c.execute(_ensure_select(sql)).fetchdf()
-    except Exception as e:
-        msg = str(e)
-        # if label() somehow wasn't registered yet (fresh process), try once
-        if "Scalar Function with name label does not exist" in msg:
-            register_label_udf(c)
-            df = c.execute(_ensure_select(sql)).fetchdf()
-        else:
-            raise
-    return {"rows": json.loads(df.to_json(orient="records"))}
+# ------------------- pandas aggregate tool (no SQL required) -------------------
+import pandas as pd
 
+def _load_df_for(cols: list[str]) -> pd.DataFrame:
+    if not cols:
+        cols = ["*"]
+    col_list = ", ".join(qi(c) for c in cols) if cols != ["*"] else "*"
+    return con().execute(f"SELECT {col_list} FROM {qi(TABLE)}").df()
+
+def _apply_labels(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    meta = load_meta()
+    vmap_all = meta.get("value_labels", {})
+    if not vmap_all:
+        return df
+    df = df.copy()
+    for col in cols:
+        if col in df.columns and col in vmap_all:
+            mapping = {str(k): v for k, v in vmap_all[col].items()}
+            df[col] = df[col].map(lambda x: mapping.get(str(x), x))
+    return df
+
+def _filter_df(df: pd.DataFrame, flt: dict | None) -> pd.DataFrame:
+    if not flt:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for col, rule in flt.items():
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if isinstance(rule, dict):
+            if "in" in rule:     mask &= s.astype(str).isin([str(x) for x in rule["in"]])
+            if "not_in" in rule: mask &= ~s.astype(str).isin([str(x) for x in rule["not_in"]])
+            if "eq" in rule:     mask &= s == rule["eq"]
+            if "ne" in rule:     mask &= s != rule["ne"]
+            if "gt" in rule:     mask &= s > rule["gt"]
+            if "gte" in rule:    mask &= s >= rule["gte"]
+            if "lt" in rule:     mask &= s < rule["lt"]
+            if "lte" in rule:    mask &= s <= rule["lte"]
+        else:
+            if isinstance(rule, (list, tuple, set)):
+                mask &= s.astype(str).isin([str(x) for x in rule])
+            else:
+                mask &= s == rule
+    return df[mask]
+
+def t_aggregate(
+    groupby: list[str],
+    metrics: list[dict],
+    filter: dict | None = None,
+    weight: str | None = None,
+    use_labels: bool = True,
+    top: int | None = None,
+    dropna: bool = True,
+):
+    """
+    metrics examples:
+      [{"op":"count"}]
+      [{"op":"mean","col":"Q1"}]
+      [{"op":"pct","col":"Q5","where":{"Q5":[5]}}]
+      [{"op":"sum","col":"Spend"}]
+    Supported ops: "count", "sum", "mean", "pct"
+    """
+    groupby = groupby or []
+    metric_cols = [m.get("col") for m in metrics if m.get("col")]
+    needed_cols = set(groupby + ([weight] if weight else []) + [c for c in metric_cols if c])
+
+    if filter:
+        for k in filter.keys():
+            needed_cols.add(k)
+    for m in metrics:
+        if m.get("op") == "pct" and isinstance(m.get("where"), dict):
+            for k in m["where"].keys():
+                needed_cols.add(k)
+
+    df = _load_df_for(sorted(needed_cols) if needed_cols else ["*"])
+
+    if dropna and groupby:
+        df = df.dropna(subset=groupby)
+
+    df = _filter_df(df, filter)
+
+    if use_labels and groupby:
+        df = _apply_labels(df, groupby)
+
+    w = None
+    if weight and weight in df.columns:
+        w = df[weight].astype(float)
+        w = w.where(w.notna() & (w >= 0), 0.0)
+
+    # build groups
+    if groupby:
+        groups = df.groupby(groupby, dropna=False, sort=False)
+    else:
+        groups = [ ((), df) ]
+
+    out_rows = []
+    for keys, gdf in (groups if isinstance(groups, list) else groups):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        base_n = int(len(gdf))
+        base_w = float(gdf[weight].astype(float).where(lambda s: s.notna() & (s>=0), 0.0).sum()) if w is not None else None
+
+        row = {}
+        for i, col in enumerate(groupby):
+            row[col] = keys[i]
+
+        for m in metrics:
+            op = m.get("op")
+            col = m.get("col")
+            name = m.get("name") or (op if not col else f"{op}_{col}")
+
+            if op == "count":
+                val = base_w if w is not None else base_n
+
+            elif op == "sum":
+                s = gdf[col].astype(float)
+                if w is None:
+                    val = float(s.sum(skipna=True))
+                else:
+                    val = float((s.fillna(0.0) * gdf[weight].astype(float).fillna(0.0)).sum())
+
+            elif op == "mean":
+                s = gdf[col].astype(float)
+                if w is None:
+                    val = float(s.mean(skipna=True))
+                else:
+                    ww = gdf[weight].astype(float).fillna(0.0)
+                    num = float((s.fillna(0.0) * ww).sum())
+                    den = float(ww.where(s.notna(), 0.0).sum())
+                    val = float(num / den) if den > 0 else math.nan
+
+            elif op == "pct":
+                sub = _filter_df(gdf, m.get("where"))
+                if w is None:
+                    den = len(gdf)
+                    num = len(sub)
+                else:
+                    den = float(gdf[weight].astype(float).fillna(0.0).sum())
+                    num = float(sub[weight].astype(float).fillna(0.0).sum())
+                val = float(100.0 * num / den) if den > 0 else math.nan
+
+            else:
+                val = None
+
+            row[name] = val
+
+        row["_base_n"] = base_n
+        if base_w is not None:
+            row["_base_w"] = base_w
+
+        out_rows.append(row)
+
+    if top and groupby and metrics:
+        first_metric = metrics[0].get("name") or (metrics[0]["op"] if not metrics[0].get("col") else f"{metrics[0]['op']}_{metrics[0]['col']}")
+        out_rows = sorted(
+            out_rows,
+            key=lambda r: (r.get(first_metric) is None, r.get(first_metric)),
+            reverse=True
+        )[:top]
+
+    return {"rows": out_rows, "groupby": groupby, "metrics": metrics}
+
+# ------------------- LLM tool wiring -------------------
 TOOLS = [
   {"type":"function","function":{"name":"get_schema","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function":{"name":"value_counts","parameters":{"type":"object","properties":{"column":{"type":"string"},"top":{"type":"integer"}},"required":["column"]}}},  # noqa
+  {"type":"function","function":{"name":"value_counts","parameters":{"type":"object","properties":{"column":{"type":"string"},"top":{"type":"integer"}},"required":["column"]}}},
   {"type":"function","function":{"name":"describe","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function":{"name":"run_sql","parameters":{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}}}
+  {"type":"function","function":{"name":"run_sql","parameters":{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}}},
+
+  # pandas aggregate tool
+  {"type":"function","function":{
+    "name":"aggregate",
+    "parameters":{
+      "type":"object",
+      "properties":{
+        "groupby":{"type":"array","items":{"type":"string"}},
+        "metrics":{"type":"array","items":{"type":"object"}},
+        "filter":{"type":"object"},
+        "weight":{"type":"string"},
+        "use_labels":{"type":"boolean"},
+        "top":{"type":"integer"},
+        "dropna":{"type":"boolean"}
+      },
+      "required":["groupby","metrics"]
+    }
+  }},
 ]
 
 NAME_TO_TOOL = {
   "get_schema": lambda **kw: t_schema(),
   "value_counts": lambda **kw: t_value_counts(**kw),
   "describe":    lambda **kw: t_describe(),
-  "run_sql":     lambda **kw: _run_sql_impl(kw["sql"])
+  "run_sql":     lambda **kw: _run_sql_impl(kw["sql"]),
+  "aggregate":   lambda **kw: t_aggregate(**kw),
 }
 
-# ---- “ask the dataset” via OpenRouter tool-calling ---------------------------
-
+# ------------------- /ask endpoint -------------------
 class AskIn(BaseModel):
     question: str
 
 @app.post("/ask")
 def ask(body: AskIn, request: Request):
     if not OPENROUTER["client"]:
-        return JSONResponse({"error":"OpenRouter key not set. Use the 'Set OpenRouter key' box on this page."}, status_code=400)
+        return JSONResponse({"error":"OpenRouter client not initialized."}, status_code=400)
 
     try:
         msgs = [
-            {"role":"system","content":"You are a data analyst. Prefer tools to inspect schema and compute answers. When writing SQL, use SELECT-only. If a variable has SPSS value labels, use label('<col>', \"<col>\") to render categories nicely."},
+            {
+                "role":"system",
+                "content":(
+                  "You are a market-research data analyst. "
+                  "Prefer the `aggregate` tool for counts, %, weighted means, and grouped rollups. "
+                  "Use `value_counts` for quick 1D counts. Use `describe` for numeric summaries. "
+                  "Avoid writing SQL unless the user explicitly asks for SQL. "
+                  "When possible, return compact, readable tables and one-sentence summaries."
+                )
+            },
             {"role":"user","content": body.question}
         ]
 
         client = OPENROUTER["client"]; model = OPENROUTER["model"]
 
-        # 1) First turn: let the model decide tool calls
+        # turn 1: let model pick tools
         r = client.chat.completions.create(
             model=model,
             messages=msgs,
@@ -300,7 +457,6 @@ def ask(body: AskIn, request: Request):
             max_tokens=800,
         )
 
-        # Defensive: unify access for SDK or dict-like payloads
         m = r.choices[0].message
         raw_tool_calls = getattr(m, "tool_calls", None) or (m.get("tool_calls") if isinstance(m, dict) else None)
 
@@ -308,58 +464,48 @@ def ask(body: AskIn, request: Request):
 
         if raw_tool_calls:
             import json as _json
-
-            # 2) Append the assistant message that contains tool_calls (required!)
+            # append assistant with tool_calls
             norm_tool_calls = []
             for tc in raw_tool_calls:
-                fn = getattr(tc, "function", None) if hasattr(tc, "function") else (tc.get("function"))
+                fn = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function")
                 name = getattr(fn, "name", None) if hasattr(fn, "name") else (fn.get("name") if fn else None)
                 arguments = getattr(fn, "arguments", None) if hasattr(fn, "arguments") else (fn.get("arguments") if fn else None)
                 tc_id = getattr(tc, "id", None) if hasattr(tc, "id") else tc.get("id")
                 norm_tool_calls.append({
                     "id": tc_id,
                     "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments or "{}",
-                    },
+                    "function": {"name": name, "arguments": arguments or "{}"},
                 })
 
-            msgs.append({
-                "role": "assistant",
-                "content": None,           # content can be None when using tools
-                "tool_calls": norm_tool_calls,
-            })
+            msgs.append({"role":"assistant","content":None,"tool_calls":norm_tool_calls})
 
-            # 3) Execute tools and append tool results as tool messages with tool_call_id
+            # run tools
             for tc in norm_tool_calls:
                 name = tc["function"]["name"]
                 args_raw = tc["function"]["arguments"]
                 try:
-                    args = json.loads(args_raw or "{}")
+                    args = _json.loads(args_raw or "{}")
                 except Exception:
                     args = {}
-
                 fn = NAME_TO_TOOL.get(name)
                 try:
                     result = fn(**args) if fn else {"error": "unknown tool: " + str(name)}
                 except Exception as e:
+                    logging.exception("Tool %s failed", name)
                     result = {"error": str(e)}
-
                 tool_results.append({"tool": name, "args": args, "result": result})
-
                 msgs.append({
-                    "role": "tool",
+                    "role":"tool",
                     "tool_call_id": tc["id"],
                     "name": name,
-                    "content": json.dumps(result)
+                    "content": _json.dumps(result)
                 })
 
-            # 4) Second turn: model sees tool outputs and answers
+            # turn 2: final answer
             r2 = client.chat.completions.create(
                 model=model,
                 messages=msgs,
-                tools=TOOLS,          # safe to include again
+                tools=TOOLS,
                 temperature=0.1,
                 max_tokens=800,
             )
@@ -369,16 +515,13 @@ def ask(body: AskIn, request: Request):
         return {"answer": content, "tools": tool_results}
 
     except Exception as e:
-        logging.error("ASK endpoint failed: %s\n%s", str(e), traceback.format_exc())
+        logging.error("ASK endpoint failed: %s", e, exc_info=True)
         return JSONResponse({"error": f"/ask failed: {e}"}, status_code=500)
 
-# ---------- tiny UI (root) ----------------------------------------------------
-
+# ------------------- tiny UI -------------------
 @app.get("/", response_class=HTMLResponse)
 def ui():
-    # keep the dynamic bit small, avoid f-strings over JS/CSS with braces
-    stats = f'<p><small>DB: {DB_PATH} | META: {META_PATH} | BATCH_ROWS: {BATCH}</small></p>'
-
+    stats = '<p><small>DB: ' + DB_PATH + ' | META: ' + META_PATH + ' | BATCH_ROWS: ' + str(BATCH) + '</small></p>'
     return """
 <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>SPSS POC</title>
@@ -394,19 +537,12 @@ label b{display:inline-block;min-width:180px}
 </style>
 </head><body>
 <h1>SPSS POC</h1>
+<p><small>Model & key are hardcoded in server code.</small></p>
 """ + stats + """
-<div class="card">
-  <h2>0) Set OpenRouter key (stored in memory only)</h2>
-  <label><b>API Key</b></label><input id="key" type="text" placeholder="sk-or-..." />
-  <label><b>Model</b></label><input id="model" type="text" value="openai/gpt-4o-mini" />
-  <br/><br/><button id="setKeyBtn">Set OpenRouter key</button>
-  <div id="cfgOut"></div>
-</div>
-
 <div class="card">
   <h2>1) Upload .sav</h2>
   <input id="file" type="file" accept=".sav" />
-  <p><small>Start small. This is a POC.</small></p>
+  <p><small>POC: keep it modest in size.</small></p>
   <button id="ingestBtn">Ingest</button>
   <div id="ingestOut"></div>
 </div>
@@ -419,7 +555,7 @@ label b{display:inline-block;min-width:180px}
 
 <div class="card">
   <h2>3) Ask the dataset</h2>
-  <textarea id="q" rows="3">Show top 10 values of DB2 with counts (use labels).</textarea><br/><br/>
+  <textarea id="q" rows="3">List out the counts of DB2 (use labels).</textarea><br/><br/>
   <button id="askBtn">Ask</button>
   <h3>Answer</h3>
   <div id="answer" style="white-space:pre-wrap"></div>
@@ -431,24 +567,6 @@ label b{display:inline-block;min-width:180px}
 const base = location.origin;
 const el = (id) => document.getElementById(id);
 const jfmt = (x) => { try { return JSON.stringify(x, null, 2); } catch(e){ return String(x); } };
-
-el('setKeyBtn').onclick = async () => {
-  const key = el('key').value.trim();
-  const model = el('model').value.trim() || 'openai/gpt-4o-mini';
-  if(!key){ alert('Enter your sk-or-... key'); return; }
-  el('setKeyBtn').disabled = true;
-  el('cfgOut').textContent = 'Setting...';
-  try {
-    const r = await fetch(base + '/config', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ openrouter_api_key: key, model })
-    });
-    const txt = await r.text(); let j={}; try{ j=JSON.parse(txt) }catch{}
-    if(!r.ok){ el('cfgOut').textContent = j.error ? ('Error: ' + j.error) : ('HTTP '+r.status+' '+txt); }
-    else { el('cfgOut').textContent = 'OK. Model: ' + (j.model || model); }
-  } catch(e){ el('cfgOut').textContent = String(e); }
-  finally { el('setKeyBtn').disabled = false; }
-};
 
 el('ingestBtn').onclick = async () => {
   const f = el('file').files[0];
@@ -485,4 +603,3 @@ el('askBtn').onclick = async () => {
 </script>
 </body></html>
 """
-
