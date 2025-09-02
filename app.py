@@ -1,8 +1,8 @@
 from fastapi.responses import HTMLResponse
 
-import os, json, tempfile, logging
+import os, json, tempfile, logging, traceback
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -29,6 +29,7 @@ app.add_middleware(
 # ---- in-memory OpenRouter client (set from the UI) ----
 OPENROUTER = {"client": None, "model": "openai/gpt-4o-mini", "error": None}
 
+# ---- helpers ----
 def sanitize(name: str) -> str:
     return name.replace(" ", "_").replace("-", "_")
 
@@ -36,10 +37,9 @@ def qi(name: str) -> str:
     # quote a SQL identifier for DuckDB: "foo""bar" style
     return '"' + str(name).replace('"', '""') + '"'
 
-
-def con():
-    import duckdb
-    return duckdb.connect(DB_PATH)
+def duckdb_literal(s: str) -> str:
+    # quote a SQL string literal
+    return "'" + str(s).replace("'", "''") + "'"
 
 def load_meta():
     try:
@@ -54,6 +54,58 @@ def save_meta(m: dict):
             json.dump(m, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Failed to write metadata: {e}")
+
+# Register value-label UDF once per connection
+def register_label_udf(c):
+    meta = load_meta()
+    vlabels = meta.get("value_labels", {})  # {"gender": {"1":"Male","2":"Female"}, ...}
+
+    # normalize keys in mapping to strings for robust matching
+    norm = {}
+    for col, mapping in vlabels.items():
+        norm[str(col)] = {str(k): v for k, v in mapping.items()}
+    vlabels = norm
+
+    def _label(col_name, val):
+        try:
+            mapping = vlabels.get(str(col_name), None)
+            if mapping is None:
+                return val
+            key = None if val is None else str(val)
+            if key is None:
+                return val
+            return mapping.get(key, mapping.get(val, val))
+        except Exception:
+            return val
+
+    # name: label(col_name, value) -> string
+    try:
+        c.create_function("label", _label, [str, object], str)
+    except Exception:
+        # if already exists in this process/conn, ignore
+        pass
+
+def con():
+    import duckdb
+    c = duckdb.connect(DB_PATH)
+    register_label_udf(c)
+    return c
+
+# pick a canonical weight column by creating a view data_w with 'w'
+DEFAULT_WEIGHT_COLUMNS = ["w", "weight", "case_weight", "CaseWeight", "Weight"]
+
+def ensure_weight_view():
+    c = con()
+    cols = [r[1] for r in c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchall()]
+    chosen = next((nm for nm in DEFAULT_WEIGHT_COLUMNS if nm in cols and nm != "w"), None)
+    if chosen:
+        c.execute(f'CREATE OR REPLACE VIEW {qi("data_w")} AS SELECT *, COALESCE({qi(chosen)}, 1.0) AS w FROM {qi(TABLE)}')
+    else:
+        # either already has w, or no weight column -> default 1.0
+        if "w" in cols:
+            c.execute(f'CREATE OR REPLACE VIEW {qi("data_w")} AS SELECT * FROM {qi(TABLE)}')
+        else:
+            c.execute(f'CREATE OR REPLACE VIEW {qi("data_w")} AS SELECT *, 1.0 AS w FROM {qi(TABLE)}')
 
 # ---------- config endpoint: paste key from the page ----------
 class SetConfigIn(BaseModel):
@@ -70,16 +122,15 @@ def set_config(cfg: SetConfigIn):
         model = cfg.model or OPENROUTER['model']
 
         # Build our own HTTP client so the OpenAI SDK never tries to pass `proxies=...`
-        # If you actually need a proxy, set it here inside httpx.Client(proxies=...).
-        http_client = httpx.Client(timeout=60.0)  # inherits HTTP(S)_PROXY from env automatically
+        http_client = httpx.Client(timeout=60.0)  # respects HTTP(S)_PROXY by default
 
         client = OpenAI(
             base_url='https://openrouter.ai/api/v1',
             api_key=cfg.openrouter_api_key.strip(),
             http_client=http_client,
-            # Optional, recommended by OpenRouter for analytics/rate-limiting fairness:
+            # Optional OpenRouter headers (set your domain/title if you want analytics):
             default_headers={
-                'HTTP-Referer': 'https://example.com',  # set your site if you have one
+                'HTTP-Referer': 'https://example.com',
                 'X-Title': 'SPSS POC',
             },
         )
@@ -97,8 +148,7 @@ def set_config(cfg: SetConfigIn):
 async def ingest(file: UploadFile = File(...)):
     import duckdb, pyreadstat, pandas as pd  # lazy imports
     # save upload to temp
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(delete=False, suffix=".sav") as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".sav") as tmp:
         tmp.write(await file.read())
         sav_path = tmp.name
 
@@ -108,8 +158,8 @@ async def ingest(file: UploadFile = File(...)):
     name_map  = dict(zip(meta.column_names, col_names))
 
     c = con()
-    c.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} AS SELECT 1 AS _init LIMIT 0;")
-    c.execute(f"DELETE FROM {TABLE};")
+    c.execute(f"CREATE TABLE IF NOT EXISTS {qi(TABLE)} AS SELECT 1 AS _init LIMIT 0;")
+    c.execute(f"DELETE FROM {qi(TABLE)};")
 
     # chunked load to avoid RAM spikes
     offset = 0; total = 0
@@ -121,9 +171,9 @@ async def ingest(file: UploadFile = File(...)):
             if df[col].dtype == "object":
                 df[col] = df[col].astype("string")
         if total == 0:
-            c.register("chunk", df); c.execute(f"CREATE OR REPLACE TABLE {TABLE} AS SELECT * FROM chunk"); c.unregister("chunk")
+            c.register("chunk", df); c.execute(f"CREATE OR REPLACE TABLE {qi(TABLE)} AS SELECT * FROM chunk"); c.unregister("chunk")
         else:
-            c.register("chunk", df); c.execute(f"INSERT INTO {TABLE} SELECT * FROM chunk"); c.unregister("chunk")
+            c.register("chunk", df); c.execute(f"INSERT INTO {qi(TABLE)} SELECT * FROM chunk"); c.unregister("chunk")
         n = len(df); total += n; offset += n
         if n < BATCH: break
 
@@ -135,20 +185,32 @@ async def ingest(file: UploadFile = File(...)):
     try: os.remove(sav_path)
     except Exception: pass
 
+    # ensure canonical weight view exists for this dataset
+    ensure_weight_view()
+
     return {"status": "ok", "rows": total, "columns": col_names}
 
 @app.get("/schema")
 def schema():
     c = con()
-    info = c.execute(f"PRAGMA table_info('{TABLE}')").fetchall()
+    info = c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchall()
     meta = load_meta()
     cols = [{"name": i[1], "type": i[2], "label": meta.get("column_labels", {}).get(i[1], "")} for i in info]
     return {"table": TABLE, "columns": cols, "rows": meta.get("rows"), "source": meta.get("source_filename")}
 
 def _ensure_select(sql: str) -> str:
+    # allow WITH ... SELECT
     s = sql.strip().lower()
-    if not s.startswith("select"): raise ValueError("SELECT only")
-    if " limit " not in s: sql = sql.strip() + " LIMIT 1000"
+    if not (s.startswith("select") or s.startswith("with")):
+        raise ValueError("SELECT/WITH only")
+    # block anything dangerous-ish
+    banned = [";", " drop ", " create ", " alter ", " insert ", " update ", " delete ", " attach ", " copy ", " pragma "]
+    if any(b in s for b in banned):
+        raise ValueError("Only a single SELECT/WITH query is allowed")
+    # add LIMIT if user forgot and query isn't a naked CTE block
+    if " limit " not in s:
+        # naive check: if it ends with ')', it might still be a SELECT (...) subquery; we still add LIMIT
+        sql = sql.strip() + " LIMIT 1000"
     return sql
 
 class SqlIn(BaseModel):
@@ -162,67 +224,31 @@ def sql(q: SqlIn):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ---- “ask the dataset” via OpenRouter tool-calling ----
+# ---- “ask the dataset” via OpenRouter tool-calling (SQL-first) ----
 class AskIn(BaseModel):
     question: str
 
 def t_schema(): return schema()
 
-def t_value_counts(column: str, top: int = 20):
-    col = qi(column)
-    tbl = qi(TABLE)
-    df = con().execute(
-        f"SELECT {col} AS value, COUNT(*) AS count "
-        f"FROM {tbl} GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT {int(top)}"
-    ).fetchdf()
-    return {"column": column, "rows": json.loads(df.to_json(orient="records"))}
-
-
-def t_describe():
-    c = con()
-    info = c.execute(f"PRAGMA table_info({qi(TABLE)})").fetchdf()
-
-    # DuckDB numeric-ish types we can aggregate with min/max/avg
-    numeric_prefixes = (
-        "TINYINT","SMALLINT","INTEGER","BIGINT","HUGEINT",
-        "UTINYINT","USMALLINT","UINTEGER","UBIGINT",
-        "FLOAT","REAL","DOUBLE","DECIMAL"
-    )
-    num_cols = [row["name"] for _, row in info.iterrows()
-                if str(row["type"]).upper().startswith(numeric_prefixes)]
-
-    if not num_cols:
-        return {"columns": [], "summary_row": {}}
-
-    expr_parts = []
-    for c_name in num_cols:
-        idq = qi(c_name)
-        # aliases are plain (safe ascii)
-        expr_parts.append(f"min({idq}) as {c_name}_min")
-        expr_parts.append(f"max({idq}) as {c_name}_max")
-        expr_parts.append(f"avg({idq}) as {c_name}_mean")
-
-    expr = ", ".join(expr_parts)
-    df = c.execute(f"SELECT {expr} FROM {qi(TABLE)}").fetchdf()
-    return {"columns": num_cols, "summary_row": json.loads(df.to_json(orient='records'))[0]}
-
-
 TOOLS = [
-  {"type":"function","function":{"name":"get_schema","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function":{"name":"value_counts","parameters":{"type":"object","properties":{"column":{"type":"string"},"top":{"type":"integer"}},"required":["column"]}}},
-  {"type":"function","function":{"name":"describe","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function":{"name":"run_sql","parameters":{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}}}
+  {"type":"function","function":{"name":"run_sql","parameters":{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}}},
+  {"type":"function","function":{"name":"get_schema","parameters":{"type":"object","properties":{}}}}
 ]
 
 NAME_TO_TOOL = {
   "get_schema": lambda **kw: t_schema(),
-  "value_counts": lambda **kw: t_value_counts(**kw),
-  "describe":    lambda **kw: t_describe(),
   "run_sql":     lambda **kw: {"rows": json.loads(con().execute(_ensure_select(kw["sql"])).fetchdf().to_json(orient="records"))}
 }
 
-import traceback, logging
-from fastapi import Request
+SYSTEM_PROMPT = """You are a senior market-research data analyst.
+- Always use the run_sql tool to answer, composing a single SELECT (WITH allowed).
+- Default table is data; prefer the view data_w which exposes a canonical weight column w.
+- You may use label('<column_name>', <column>) to convert coded values using SPSS value labels.
+- For percentages: return 100 * SUM(CASE WHEN <condition> THEN w ELSE 0 END) / NULLIF(SUM(w),0) AS pct, and also return SUM(w) AS base_w.
+- For weighted averages: SUM(<metric> * w) / NULLIF(SUM(w),0) AS weighted_avg, include base_w = SUM(w).
+- Use CTEs for base filters, recodes (CASE), trims (PERCENT_RANK), top-k, etc.
+- Quote identifiers that contain spaces or special characters with double quotes.
+- Never write non-SELECT statements; no PRAGMA/DDL/DML. Keep results concise."""
 
 @app.post("/ask")
 def ask(body: AskIn, request: Request):
@@ -231,13 +257,13 @@ def ask(body: AskIn, request: Request):
 
     try:
         msgs = [
-            {"role":"system","content":"You are a data analyst. Use tools first, be concise, SELECT-only."},
+            {"role":"system","content": SYSTEM_PROMPT},
             {"role":"user","content": body.question}
         ]
 
         client = OPENROUTER["client"]; model = OPENROUTER["model"]
 
-        # 1) First turn: let the model decide tool calls
+        # 1) First turn: let the model decide (should choose run_sql)
         r = client.chat.completions.create(
             model=model,
             messages=msgs,
@@ -248,16 +274,12 @@ def ask(body: AskIn, request: Request):
         )
 
         m = r.choices[0].message
-        # Extract tool_calls in a dict-friendly way
         raw_tool_calls = getattr(m, "tool_calls", None) or (m.get("tool_calls") if isinstance(m, dict) else None)
-
         tool_results = []
 
         if raw_tool_calls:
             import json as _json
 
-            # 2) IMPORTANT: append the assistant message that contains tool_calls
-            # Normalize tool_calls to plain dicts (OpenAI format)
             norm_tool_calls = []
             for tc in raw_tool_calls:
                 fn = getattr(tc, "function", None) if hasattr(tc, "function") else (tc.get("function"))
@@ -274,19 +296,15 @@ def ask(body: AskIn, request: Request):
                     },
                 })
 
-            # Append the assistant turn with tool_calls (must precede tool messages)
-            msgs.append({
-                "role": "assistant",
-                "content": None,           # content can be None when using tools
-                "tool_calls": norm_tool_calls,
-            })
+            # Append the assistant turn with tool_calls
+            msgs.append({"role": "assistant", "content": None, "tool_calls": norm_tool_calls})
 
-            # 3) Execute tools and append tool results
-            for i, tc in enumerate(norm_tool_calls):
+            # Execute tools and append results
+            for tc in norm_tool_calls:
                 name = tc["function"]["name"]
                 args_raw = tc["function"]["arguments"]
                 try:
-                    args = _json.loads(args_raw or "{}")
+                    args = json.loads(args_raw or "{}")
                 except Exception:
                     args = {}
 
@@ -302,14 +320,14 @@ def ask(body: AskIn, request: Request):
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "name": name,
-                    "content": _json.dumps(result)
+                    "content": json.dumps(result)
                 })
 
-            # 4) Second turn: model sees tool outputs and answers
+            # 2) Second turn: model sees tool outputs and answers
             r2 = client.chat.completions.create(
                 model=model,
                 messages=msgs,
-                tools=TOOLS,          # safe to include again
+                tools=TOOLS,
                 temperature=0.1,
                 max_tokens=800,
             )
@@ -321,8 +339,6 @@ def ask(body: AskIn, request: Request):
     except Exception as e:
         logging.error("ASK endpoint failed: %s\n%s", str(e), traceback.format_exc())
         return JSONResponse({"error": f"/ask failed: {e}"}, status_code=500)
-
-
 
 # ---------- tiny UI (root) ----------
 @app.get("/", response_class=HTMLResponse)
@@ -370,7 +386,7 @@ label b{display:inline-block;min-width:180px}
 
 <div class="card">
   <h2>3) Ask the dataset</h2>
-  <textarea id="q" rows="3">Show top 10 values of Gender with counts.</textarea><br/><br/>
+  <textarea id="q" rows="3">Show % of Q1=1 among UK adults by Gender, include base sizes. Use data_w and label().</textarea><br/><br/>
   <button id="askBtn">Ask</button>
   <h3>Answer</h3>
   <div id="answer" style="white-space:pre-wrap"></div>
