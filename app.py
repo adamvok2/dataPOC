@@ -195,7 +195,7 @@ NAME_TO_TOOL = {
   "run_sql":     lambda **kw: {"rows": json.loads(con().execute(_ensure_select(kw["sql"])).fetchdf().to_json(orient="records"))}
 }
 
-import traceback
+import traceback, logging
 from fastapi import Request
 
 @app.post("/ask")
@@ -211,7 +211,7 @@ def ask(body: AskIn, request: Request):
 
         client = OPENROUTER["client"]; model = OPENROUTER["model"]
 
-        # first turn: let the model choose tools
+        # 1) First turn: let the model decide tool calls
         r = client.chat.completions.create(
             model=model,
             messages=msgs,
@@ -221,19 +221,44 @@ def ask(body: AskIn, request: Request):
             max_tokens=800,
         )
 
-        # some SDKs return .choices[0].message as dict-like, some as object — normalize
         m = r.choices[0].message
-        tool_calls = getattr(m, "tool_calls", None) or getattr(m, "tool_calls", [])  # keep as list if present
+        # Extract tool_calls in a dict-friendly way
+        raw_tool_calls = getattr(m, "tool_calls", None) or (m.get("tool_calls") if isinstance(m, dict) else None)
 
         tool_results = []
-        if tool_calls:
+
+        if raw_tool_calls:
             import json as _json
 
-            # execute tool calls
-            for tc in tool_calls:
-                # tc may be a pydantic-ish object or plain dict
-                name = getattr(tc.function, "name", None) if hasattr(tc, "function") else (tc.get("function", {}).get("name"))
-                args_raw = getattr(tc.function, "arguments", None) if hasattr(tc, "function") else (tc.get("function", {}).get("arguments"))
+            # 2) IMPORTANT: append the assistant message that contains tool_calls
+            # Normalize tool_calls to plain dicts (OpenAI format)
+            norm_tool_calls = []
+            for tc in raw_tool_calls:
+                fn = getattr(tc, "function", None) if hasattr(tc, "function") else (tc.get("function"))
+                name = getattr(fn, "name", None) if hasattr(fn, "name") else (fn.get("name") if fn else None)
+                arguments = getattr(fn, "arguments", None) if hasattr(fn, "arguments") else (fn.get("arguments") if fn else None)
+                tc_id = getattr(tc, "id", None) if hasattr(tc, "id") else tc.get("id")
+
+                norm_tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments or "{}",
+                    },
+                })
+
+            # Append the assistant turn with tool_calls (must precede tool messages)
+            msgs.append({
+                "role": "assistant",
+                "content": None,           # content can be None when using tools
+                "tool_calls": norm_tool_calls,
+            })
+
+            # 3) Execute tools and append tool results
+            for i, tc in enumerate(norm_tool_calls):
+                name = tc["function"]["name"]
+                args_raw = tc["function"]["arguments"]
                 try:
                     args = _json.loads(args_raw or "{}")
                 except Exception:
@@ -241,40 +266,36 @@ def ask(body: AskIn, request: Request):
 
                 fn = NAME_TO_TOOL.get(name)
                 try:
-                    result = fn(**args) if fn else {"error":"unknown tool: "+str(name)}
+                    result = fn(**args) if fn else {"error": "unknown tool: " + str(name)}
                 except Exception as e:
                     result = {"error": str(e)}
 
                 tool_results.append({"tool": name, "args": args, "result": result})
 
-                # append tool result message
-                tool_call_id = getattr(tc, "id", None) or tc.get("id")
                 msgs.append({
-                    "role":"tool",
-                    "tool_call_id": tool_call_id,
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
                     "name": name,
                     "content": _json.dumps(result)
                 })
 
-            # second turn: give the tool outputs back to the model
+            # 4) Second turn: model sees tool outputs and answers
             r2 = client.chat.completions.create(
                 model=model,
                 messages=msgs,
-                tools=TOOLS,          # include again (some routers are picky)
+                tools=TOOLS,          # safe to include again
                 temperature=0.1,
                 max_tokens=800,
             )
             m = r2.choices[0].message
-        else:
-            tool_results = []
 
-        content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else None) or ""
+        content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else "") or ""
         return {"answer": content, "tools": tool_results}
 
     except Exception as e:
-        # log full traceback to server logs and return readable error
         logging.error("ASK endpoint failed: %s\n%s", str(e), traceback.format_exc())
         return JSONResponse({"error": f"/ask failed: {e}"}, status_code=500)
+
 
 
 # ---------- tiny UI (root) ----------
