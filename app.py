@@ -195,37 +195,87 @@ NAME_TO_TOOL = {
   "run_sql":     lambda **kw: {"rows": json.loads(con().execute(_ensure_select(kw["sql"])).fetchdf().to_json(orient="records"))}
 }
 
+import traceback
+from fastapi import Request
+
 @app.post("/ask")
-def ask(body: AskIn):
+def ask(body: AskIn, request: Request):
     if not OPENROUTER["client"]:
         return JSONResponse({"error":"OpenRouter key not set. Use the 'Set OpenRouter key' box on this page."}, status_code=400)
 
-    msgs = [
-        {"role":"system","content":"You are a data analyst. Use tools first, be concise, SELECT-only."},
-        {"role":"user","content": body.question}
-    ]
+    try:
+        msgs = [
+            {"role":"system","content":"You are a data analyst. Use tools first, be concise, SELECT-only."},
+            {"role":"user","content": body.question}
+        ]
 
-    client = OPENROUTER["client"]; model = OPENROUTER["model"]
-    r = client.chat.completions.create(
-        model=model, messages=msgs, tools=TOOLS, tool_choice="auto", temperature=0.1
-    )
-    m = r.choices[0].message
+        client = OPENROUTER["client"]; model = OPENROUTER["model"]
 
-    tool_calls = []
-    if getattr(m, "tool_calls", None):
-        import json as _json
-        for tc in m.tool_calls:
-            name = tc.function.name
-            args = _json.loads(tc.function.arguments or "{}")
-            fn = NAME_TO_TOOL.get(name)
-            try: result = fn(**args) if fn else {"error":"unknown tool"}
-            except Exception as e: result = {"error": str(e)}
-            tool_calls.append({"tool": name, "args": args, "result": result})
-            msgs.append({"role":"tool","tool_call_id": tc.id, "name": name, "content": json.dumps(result)})
-        r2 = client.chat.completions.create(model=model, messages=msgs, temperature=0.1)
-        m = r2.choices[0].message
+        # first turn: let the model choose tools
+        r = client.chat.completions.create(
+            model=model,
+            messages=msgs,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.1,
+            max_tokens=800,
+        )
 
-    return {"answer": m.content, "tools": tool_calls}
+        # some SDKs return .choices[0].message as dict-like, some as object — normalize
+        m = r.choices[0].message
+        tool_calls = getattr(m, "tool_calls", None) or getattr(m, "tool_calls", [])  # keep as list if present
+
+        tool_results = []
+        if tool_calls:
+            import json as _json
+
+            # execute tool calls
+            for tc in tool_calls:
+                # tc may be a pydantic-ish object or plain dict
+                name = getattr(tc.function, "name", None) if hasattr(tc, "function") else (tc.get("function", {}).get("name"))
+                args_raw = getattr(tc.function, "arguments", None) if hasattr(tc, "function") else (tc.get("function", {}).get("arguments"))
+                try:
+                    args = _json.loads(args_raw or "{}")
+                except Exception:
+                    args = {}
+
+                fn = NAME_TO_TOOL.get(name)
+                try:
+                    result = fn(**args) if fn else {"error":"unknown tool: "+str(name)}
+                except Exception as e:
+                    result = {"error": str(e)}
+
+                tool_results.append({"tool": name, "args": args, "result": result})
+
+                # append tool result message
+                tool_call_id = getattr(tc, "id", None) or tc.get("id")
+                msgs.append({
+                    "role":"tool",
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "content": _json.dumps(result)
+                })
+
+            # second turn: give the tool outputs back to the model
+            r2 = client.chat.completions.create(
+                model=model,
+                messages=msgs,
+                tools=TOOLS,          # include again (some routers are picky)
+                temperature=0.1,
+                max_tokens=800,
+            )
+            m = r2.choices[0].message
+        else:
+            tool_results = []
+
+        content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else None) or ""
+        return {"answer": content, "tools": tool_results}
+
+    except Exception as e:
+        # log full traceback to server logs and return readable error
+        logging.error("ASK endpoint failed: %s\n%s", str(e), traceback.format_exc())
+        return JSONResponse({"error": f"/ask failed: {e}"}, status_code=500)
+
 
 # ---------- tiny UI (root) ----------
 @app.get("/", response_class=HTMLResponse)
